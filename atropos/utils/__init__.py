@@ -21,11 +21,18 @@ apply_sglang_patch()
 from .debug import debug_batch_data, save_batch_tensors
 from .http import log_section, retry_on_failure, wait_for_service
 from .tensor import pad_sequences
-from .env_adapter import create_verl_adapter, get_verl_server_configs
+from .env_adapter import (
+    VeRLScoreAdapter,
+    compute_advantage_with_score_adapter,
+    create_verl_adapter,
+    get_verl_server_configs,
+    set_ray_connection,
+)
 
 __all__ = [
     "apply_all_patches",
     "apply_sglang_patch",
+    "compute_advantage_with_score_adapter",
     "create_verl_adapter",
     "debug_batch_data",
     "get_verl_server_configs",
@@ -33,5 +40,7 @@ __all__ = [
     "pad_sequences",
     "retry_on_failure",
     "save_batch_tensors",
+    "set_ray_connection",
+    "VeRLScoreAdapter",
     "wait_for_service",
 ]

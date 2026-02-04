@@ -58,19 +58,63 @@ urls = ray.get(coordinator.get_inference_urls.remote())
 # Build
 docker build -t atropos-verl .
 
-# Run training
+# Run training (creates new container)
 docker run --gpus all --shm-size=32g --pid=host \
+  --name atropos-training \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   atropos-verl --steps 1000
 
 # With W&B logging
 docker run --gpus all --shm-size=32g --pid=host \
+  --name atropos-training \
   -e WANDB_API_KEY=$WANDB_API_KEY \
-  atropos-verl --steps 1000 --model Qwen/Qwen3-0.6B --wandb
+  atropos-verl --steps 1000 --wandb
 
 # Interactive shell
 docker run --gpus all -it atropos-verl --shell
 ```
+
+### Managing an Existing Container
+
+If you've created a container with `--name atropos-training`, use these commands:
+
+```bash
+# Check container status
+docker ps -a --filter "name=atropos-training" --format "table {{.Status}}\t{{.Names}}"
+
+# Start the container (runs training automatically via CMD)
+docker start atropos-training
+
+# Stop training (kills all processes, container stays)
+docker exec atropos-training pkill -9 -f "python -m atropos"
+docker exec atropos-training pkill -9 -f ray
+
+# Clean up Ray state (do this before restarting)
+docker exec atropos-training rm -rf /tmp/ray/*
+
+# Clear Python cache (after code changes)
+docker exec atropos-training find /workspace -name "*.pyc" -delete
+docker exec atropos-training find /workspace -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
+
+# Restart training from scratch (RECOMMENDED)
+docker exec atropos-training pkill -9 -f "python -m atropos" 2>/dev/null
+docker exec atropos-training pkill -9 -f ray 2>/dev/null
+sleep 3
+docker exec atropos-training rm -rf /tmp/ray/*
+docker exec -d atropos-training /docker-entrypoint.sh --wandb
+
+# Check training status
+docker exec atropos-training curl -s http://localhost:8000/status
+
+# View logs
+docker logs --tail 50 atropos-training
+docker exec atropos-training tail -50 /workspace/training.log
+
+# Check GPU usage
+docker exec atropos-training nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+```
+
+**Important**: Never run the entrypoint multiple times without killing existing processes first. Each run creates a new training process with a unique Ray namespace, causing conflicts.
 
 ### Docker Options
 
@@ -95,10 +139,9 @@ Environments are exact copies of upstream Atropos files. The adapter handles all
    cp /path/to/atropos/environments/letter_counting.py environments/
    ```
 
-2. Update config (`configs/verl.yaml`):
+2. Update config (`configs/atropos.yaml`):
    ```yaml
-   api:
-     environment_module: "atropos.environments.letter_counting"
+   environment_module: "atropos.environments.letter_counting"
    ```
 
 3. Done. The adapter automatically:
@@ -129,10 +172,12 @@ The environment file generally can be an **exact copy** of upstream - no modific
 ### `configs/atropos.yaml` - Environment Settings
 
 ```yaml
+environment_module: "atropos.environments.gsm8k"
+
 env:
   group_size: 8                     # rollouts per prompt
-  batch_size: 16                    # prompts per batch
-  tokenizer_name: "Qwen/Qwen3-0.6B"
+  batch_size: 128                   # prompts per batch
+  tokenizer_name: "Qwen/Qwen2.5-3B"
   total_steps: 5000
   max_token_length: 2048
   use_wandb: false
@@ -140,11 +185,15 @@ env:
 
 ### `configs/verl.yaml` - Training Settings
 
-See `configs/verl.yaml` for full options. Key setting for environments:
+See `configs/verl.yaml` for full options. Key settings:
 
 ```yaml
-api:
-  environment_module: "atropos.environments.gsm8k"
+trainer:
+  resume_mode: disable  # Checkpoint resume not supported
+
+actor:
+  use_kl_loss: true
+  kl_loss_coef: 0.0     # KL tracked but not penalized
 ```
 
 ## Data Format
@@ -181,9 +230,11 @@ atropos/
 
 ## Known Issues & Patches
 
-Applied automatically by `docker-entrypoint.sh`:
+### Checkpoint Resume Not Supported
+Checkpoint resumption is not supported. Training must complete in a single run. The `trainer.resume_mode` is set to `disable` by default. If training is interrupted, restart from the beginning with a fresh model.
 
 ### SGLang Dict Chat Template
+Applied automatically by `docker-entrypoint.sh`:
 Models with tool-calling (Hermes) have dict chat_template. SGLang crashes with `TypeError`.
 
 ### FSDP CPU Offload

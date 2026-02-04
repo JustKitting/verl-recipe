@@ -8,10 +8,11 @@
 set -e
 
 # Configuration
-MODEL=${MODEL:-"Qwen/Qwen3-0.6B"}
+MODEL=${MODEL:-"Qwen/Qwen2.5-3B"}
 STEPS=${STEPS:-1000}
 GPUS=${GPUS:-1}
-BATCH_SIZE=${BATCH_SIZE:-16}
+BATCH_SIZE=${BATCH_SIZE:-128}
+GROUP_SIZE=${GROUP_SIZE:-8}
 ATROPOS_PORT=${ATROPOS_PORT:-8000}
 LOG_DIR=${LOG_DIR:-"./logs/gsm8k"}
 USE_WANDB=${USE_WANDB:-false}
@@ -23,15 +24,10 @@ echo "Model: $MODEL"
 echo "Steps: $STEPS"
 echo "GPUs: $GPUS"
 echo "Batch Size: $BATCH_SIZE"
+echo "Group Size: $GROUP_SIZE"
 echo "Log Dir: $LOG_DIR"
 echo "Wandb: $USE_WANDB"
 echo "=============================================="
-
-if [ "$USE_WANDB" = "true" ]; then
-    LOGGER='["console","wandb"]'
-else
-    LOGGER='["console"]'
-fi
 
 mkdir -p "$LOG_DIR"
 
@@ -59,20 +55,22 @@ for i in {1..30}; do
     sleep 1
 done
 
+# Build overrides
+OVERRIDES=""
+OVERRIDES="$OVERRIDES env.tokenizer_name=$MODEL"
+OVERRIDES="$OVERRIDES env.batch_size=$BATCH_SIZE"
+OVERRIDES="$OVERRIDES env.group_size=$GROUP_SIZE"
+OVERRIDES="$OVERRIDES env.total_steps=$STEPS"
+OVERRIDES="$OVERRIDES env.use_wandb=$USE_WANDB"
+OVERRIDES="$OVERRIDES rollout.tensor_model_parallel_size=$GPUS"
+OVERRIDES="$OVERRIDES trainer.n_gpus_per_node=$GPUS"
+
 echo ""
 echo "[2/2] Starting VeRL Trainer..."
 python -m atropos.main \
-    atropos.api_url="http://localhost:$ATROPOS_PORT" \
-    actor_rollout_ref.model.path="$MODEL" \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=$GPUS \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
-    actor_rollout_ref.rollout.dtype=float16 \
-    actor_rollout_ref.rollout.enforce_eager=True \
-    actor_rollout_ref.rollout.skip_tokenizer_init=False \
-    data.train_batch_size=$BATCH_SIZE \
-    trainer.n_gpus_per_node=$GPUS \
-    trainer.total_training_steps=$STEPS \
-    trainer.logger="$LOGGER" \
+    --atropos-config configs/atropos.yaml \
+    --verl-config configs/verl.yaml \
+    $OVERRIDES \
     > "$LOG_DIR/verl_trainer.log" 2>&1 &
 TRAINER_PID=$!
 echo "  PID: $TRAINER_PID"

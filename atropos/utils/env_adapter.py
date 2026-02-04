@@ -13,10 +13,10 @@
 # limitations under the License.
 
 import logging
-import os
-from typing import List, Tuple, Type, TypeVar
+from typing import Callable, List, Optional, Tuple, Type, TypeVar
 
 import ray
+import torch
 from atroposlib.envs.base import BaseEnv, BaseEnvConfig
 from atroposlib.envs.server_handling.server_baseline import APIServerConfig
 
@@ -26,11 +26,61 @@ from .sync_coordinator import get_coordinator
 logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseEnv)
 
+_ray_namespace: Optional[str] = None
+_ray_address: Optional[str] = None
+
+
+def set_ray_connection(namespace: str, address: str = "auto"):
+    global _ray_namespace, _ray_address
+    _ray_namespace = namespace
+    _ray_address = address
+
+
+class VeRLScoreAdapter:
+
+    @staticmethod
+    def scores_to_rewards(batch: "DataProto") -> "DataProto":
+        if "token_level_scores" in batch.batch.keys():
+            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+        return batch
+
+    @staticmethod
+    def apply_atropos_advantages(batch: "DataProto") -> "DataProto":
+        if "atropos_advantages" in batch.batch.keys():
+            batch.batch["advantages"] = (
+                batch.batch["advantages"] + batch.batch["atropos_advantages"]
+            )
+        return batch
+
+
+def compute_advantage_with_score_adapter(
+    data: "DataProto",
+    compute_advantage_fn: Callable,
+    adv_estimator,
+    gamma: float = 1.0,
+    lam: float = 1.0,
+    num_repeat: int = 1,
+    norm_adv_by_std_in_grpo: bool = True,
+    config=None,
+) -> "DataProto":
+    data = compute_advantage_fn(
+        data=data,
+        adv_estimator=adv_estimator,
+        gamma=gamma,
+        lam=lam,
+        num_repeat=num_repeat,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        config=config,
+    )
+    data = VeRLScoreAdapter.apply_atropos_advantages(data)
+    return data
+
 
 def get_verl_server_configs(model_name: str) -> List[APIServerConfig]:
     if not ray.is_initialized():
-        namespace = os.environ.get("VERL_RAY_NAMESPACE", "verl")
-        ray.init(address="auto", namespace=namespace, ignore_reinit_error=True)
+        namespace = _ray_namespace or "verl"
+        address = _ray_address or "auto"
+        ray.init(address=address, namespace=namespace, ignore_reinit_error=True)
     coordinator = get_coordinator()
     server_urls = ray.get(coordinator.get_inference_urls.remote())
 
@@ -52,13 +102,13 @@ def get_verl_server_configs(model_name: str) -> List[APIServerConfig]:
             )
         )
 
-    print(f"[verl_adapter] Configured {len(servers)} server(s), model: {model_name}")
+    logger.info(f"Configured {len(servers)} server(s), model: {model_name}")
     return servers
 
 
 def create_verl_adapter(
     env_class: Type[T],
-    default_tokenizer: str = "Qwen/Qwen3-0.6B",
+    default_tokenizer: str = "Qwen/Qwen2.5-3B",
 ) -> Type[T]:
     class VeRLAdapter(env_class):
         _verl_server_configs: List[APIServerConfig] = None

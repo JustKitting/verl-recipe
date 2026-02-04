@@ -25,6 +25,7 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss
 
 from .utils.debug import debug_batch_data, save_batch_tensors
+from .utils.env_adapter import VeRLScoreAdapter, compute_advantage_with_score_adapter
 from .utils.sync_coordinator import create_coordinator
 
 from verl.trainer.ppo.metric_utils import (
@@ -39,36 +40,30 @@ from verl.trainer.ppo.ray_trainer import (
 )
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+import numpy as np
 
 from .data_source import AtroposDataSource
+
+
+def safe_reduce_metrics(metrics: dict) -> dict:
+    result = {}
+    for key, val in metrics.items():
+        try:
+            scalar_vals = [v for v in val if np.isscalar(v) or (hasattr(v, 'shape') and v.shape == ())]
+            if not scalar_vals:
+                continue
+            if "max" in key:
+                result[key] = np.max(scalar_vals)
+            elif "min" in key:
+                result[key] = np.min(scalar_vals)
+            else:
+                result[key] = np.mean(scalar_vals)
+        except (ValueError, TypeError):
+            continue
+    return result
 from .utils.http import log_section
 
 logger = logging.getLogger(__name__)
-
-
-def compute_advantage_with_atropos_override(
-    data: DataProto,
-    adv_estimator: AdvantageEstimator,
-    gamma: float = 1.0,
-    lam: float = 1.0,
-    num_repeat: int = 1,
-    norm_adv_by_std_in_grpo: bool = True,
-    config=None,
-) -> DataProto:
-    data = compute_advantage(
-        data=data,
-        adv_estimator=adv_estimator,
-        gamma=gamma,
-        lam=lam,
-        num_repeat=num_repeat,
-        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        config=config,
-    )
-
-    if "atropos_advantages" in data.batch.keys():
-        data.batch["advantages"] = data.batch["advantages"] + data.batch["atropos_advantages"]
-
-    return data
 
 
 class RayAtroposTrainer(RayPPOTrainer):
@@ -115,6 +110,11 @@ class RayAtroposTrainer(RayPPOTrainer):
         self.sync_min_steps = sync_config.get("min_steps_between_sync", 1)
         self.sync_log_drift = sync_config.get("log_drift", True)
 
+        # Coordinator configuration
+        coordinator_config = sync_config.get("coordinator", {})
+        self._coordinator_request_timeout = coordinator_config.get("request_timeout", 300.0)
+        self._coordinator_cleanup_interval = coordinator_config.get("cleanup_interval", 30.0)
+
         self._steps_since_sync = 0
         self._last_sync_step = 0
         self._total_syncs = 0
@@ -124,8 +124,14 @@ class RayAtroposTrainer(RayPPOTrainer):
         self._debug_output_dir = debug_config.get("output_dir", "./logs")
         self._debug_save_tensors_at_steps = set(debug_config.get("save_tensors_at_steps", []))
 
-        self._sync_coordinator = create_coordinator()
-        logger.info("Created sync coordinator for request gating")
+        self._sync_coordinator = create_coordinator(
+            request_timeout=self._coordinator_request_timeout,
+            cleanup_interval=self._coordinator_cleanup_interval,
+        )
+        logger.info(
+            f"Created sync coordinator: request_timeout={self._coordinator_request_timeout}s, "
+            f"cleanup_interval={self._coordinator_cleanup_interval}s"
+        )
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler):
         self.train_dataset = None
@@ -225,11 +231,20 @@ class RayAtroposTrainer(RayPPOTrainer):
 
         proc_env = os.environ.copy()
 
+        ray_address = "auto"
+        ray_namespace = "verl"
+        if ray.is_initialized():
+            ray_address = ray.get_runtime_context().gcs_address
+            ray_namespace = ray.get_runtime_context().namespace or "verl"
+            logger.info(f"Environment will connect to Ray: address={ray_address}, namespace={ray_namespace}")
+
         api_url = self._atropos_config.get("api_url", "http://localhost:8000")
         cmd = [
             sys.executable, "-m", "atropos.environments.verl_adapter", "serve",
             "--env-module", env_module,
             "--tokenizer", str(env_cfg.tokenizer_name),
+            "--ray-namespace", ray_namespace,
+            "--ray-address", ray_address,
             "--env.tokenizer_name", str(env_cfg.tokenizer_name),
             "--env.group_size", str(env_cfg.group_size),
             "--env.batch_size", str(env_cfg.batch_size),
@@ -299,11 +314,11 @@ class RayAtroposTrainer(RayPPOTrainer):
         if self._steps_since_sync < self.sync_min_steps:
             return False, metrics
 
+        # Sync when queue is low or max steps reached
         if queue_size <= self.sync_queue_threshold:
             metrics["staleness/sync_reason"] = "queue_low"
             return True, metrics
-
-        if self._steps_since_sync >= self.sync_max_steps:
+        elif self._steps_since_sync >= self.sync_max_steps:
             metrics["staleness/sync_reason"] = "max_steps"
             return True, metrics
 
@@ -340,13 +355,13 @@ class RayAtroposTrainer(RayPPOTrainer):
         self._last_sync_step = self.global_steps
         self._total_syncs += 1
 
-    def _load_checkpoint(self):
+    def _load_checkpoint(self) -> bool:
         import os
 
         from verl.utils.checkpoint.checkpoint_handler import find_latest_ckpt_path
 
         if self.config.trainer.resume_mode == "disable":
-            return 0
+            return False
 
         checkpoint_folder = self.config.trainer.default_local_dir
         if not os.path.isabs(checkpoint_folder):
@@ -356,7 +371,7 @@ class RayAtroposTrainer(RayPPOTrainer):
         if self.config.trainer.resume_mode == "auto":
             if global_step_folder is None:
                 print("Training from scratch")
-                return 0
+                return False
         elif self.config.trainer.resume_mode == "resume_path":
             global_step_folder = self.config.trainer.resume_from_path
             if not os.path.isabs(global_step_folder):
@@ -372,7 +387,7 @@ class RayAtroposTrainer(RayPPOTrainer):
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
         )
 
-        print("Skipping dataloader state restoration")
+        return True
 
     def fit(self):
         from omegaconf import OmegaConf
@@ -393,6 +408,7 @@ class RayAtroposTrainer(RayPPOTrainer):
         self._start_trajectory_api()
         self._start_environment()
         self._register_with_atropos()
+
         self._force_initial_sync = True
 
         progress_bar = tqdm(
@@ -425,7 +441,7 @@ class RayAtroposTrainer(RayPPOTrainer):
 
                     if "token_level_scores" not in batch.batch.keys():
                         raise ValueError("Atropos batch missing 'token_level_scores'")
-                    batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                    batch = VeRLScoreAdapter.scores_to_rewards(batch)
                     batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -442,28 +458,29 @@ class RayAtroposTrainer(RayPPOTrainer):
                             loss_scale_factor=actor_config.get("loss_scale_factor", 1.0),
                         )
                         metrics["actor/entropy"] = entropy_agg.detach().item()
-
-                        # DEBUG: Compare rollout vs actor log probs
-                        try:
-                            rlp = batch.batch["rollout_log_probs"]
-                            alp = computed_log_prob.batch["old_log_probs"]
-                            rmask = batch.batch["response_mask"]
-                            ids = batch.batch["input_ids"]
-                            print(f"[LOGPROB DEBUG] Step {self.global_steps}: rlp shape={rlp.shape}, alp shape={alp.shape}, rmask shape={rmask.shape}", flush=True)
-                            ex = 0
-                            resp_len = int(rmask[ex].sum().item())
-                            r_lp = rlp[ex, :resp_len]
-                            a_lp = alp[ex, :resp_len]
-                            diff = (a_lp - r_lp).abs()
-                            print(f"[LOGPROB DEBUG] resp_len={resp_len}", flush=True)
-                            print(f"[LOGPROB DEBUG] Rollout first 10: {r_lp[:10].tolist()}", flush=True)
-                            print(f"[LOGPROB DEBUG] Actor   first 10: {a_lp[:10].tolist()}", flush=True)
-                            print(f"[LOGPROB DEBUG] Diff    first 10: {diff[:10].tolist()}", flush=True)
-                            print(f"[LOGPROB DEBUG] Mean diff={diff.mean().item():.4f}, Max={diff.max().item():.4f}", flush=True)
-                        except Exception as e:
-                            print(f"[LOGPROB DEBUG] ERROR: {e}", flush=True)
-
                         batch.batch["old_log_probs"] = computed_log_prob.batch["old_log_probs"]
+
+                    # Log drift for monitoring
+                    if "rollout_log_probs" in batch.batch:
+                        stale_rollout_lp = batch.batch["rollout_log_probs"]
+                        fresh_old_lp = batch.batch["old_log_probs"]
+                        response_mask = batch.batch["response_mask"]
+
+                        if response_mask.sum() > 0:
+                            diff = (fresh_old_lp - stale_rollout_lp).abs()
+                            mean_diff = (diff * response_mask).sum() / response_mask.sum()
+                            max_diff = (diff * response_mask).max()
+                            metrics["staleness/rollout_lp_drift"] = mean_diff.item()
+                            metrics["staleness/rollout_lp_max_drift"] = max_diff.item()
+
+                    # Apply rollout correction (IS weights + rejection sampling)
+                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                    if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:
+                        from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+                        batch, rollout_corr_metrics = compute_rollout_correction_and_add_to_batch(
+                            batch, rollout_corr_config
+                        )
+                        metrics.update(rollout_corr_metrics)
 
                     if self.use_reference_policy:
                         with marked_timer("ref", timing_raw, color="olive"):
@@ -475,65 +492,15 @@ class RayAtroposTrainer(RayPPOTrainer):
                             ref_log_prob = None  # Free after union
 
                     with marked_timer("adv", timing_raw, color="green"):
-                        batch = compute_advantage_with_atropos_override(
+                        batch = compute_advantage_with_score_adapter(
                             data=batch,
+                            compute_advantage_fn=compute_advantage,
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
                             norm_adv_by_std_in_grpo=self.config.algorithm.norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
-
-                    # DEBUG: Check if advantages are correctly signed
-                    if self.global_steps <= 3:
-                        scores = batch.batch["token_level_scores"]
-                        advantages = batch.batch["advantages"]
-                        response_mask = batch.batch["response_mask"]
-                        input_ids = batch.batch["input_ids"]
-                        # Get per-sequence scores (sum of token-level, which is just the single score on last token)
-                        seq_scores = (scores * response_mask).sum(dim=-1)
-                        seq_advantages = (advantages * response_mask).sum(dim=-1)
-                        # Check correlation: positive scores should have positive advantages
-                        pos_score_mask = seq_scores > 0
-                        neg_score_mask = seq_scores < 0
-                        if pos_score_mask.any():
-                            avg_adv_for_pos = seq_advantages[pos_score_mask].mean().item()
-                            print(f"[DEBUG] Step {self.global_steps}: Avg advantage for CORRECT (+1): {avg_adv_for_pos:.4f}", flush=True)
-                        if neg_score_mask.any():
-                            avg_adv_for_neg = seq_advantages[neg_score_mask].mean().item()
-                            print(f"[DEBUG] Step {self.global_steps}: Avg advantage for INCORRECT (-1): {avg_adv_for_neg:.4f}", flush=True)
-                        print(f"[DEBUG] Step {self.global_steps}: Score dist: +1={pos_score_mask.sum().item()}, -1={neg_score_mask.sum().item()}", flush=True)
-
-                        # Show first 2 examples with token-level detail
-                        for ex_idx in range(min(2, scores.shape[0])):
-                            resp_mask = response_mask[ex_idx]
-                            resp_len = int(resp_mask.sum().item())
-                            if resp_len == 0:
-                                continue
-                            # Find response start (first 1 in mask after padding)
-                            resp_start = (resp_mask.cumsum(0) == 1).nonzero(as_tuple=True)[0][0].item()
-                            resp_end = resp_start + resp_len
-
-                            ex_tokens = input_ids[ex_idx, resp_start:resp_end].tolist()
-                            ex_scores = scores[ex_idx, :resp_len].tolist()
-                            ex_advs = advantages[ex_idx, :resp_len].tolist()
-
-                            # Decode tokens
-                            try:
-                                decoded = self.tokenizer.decode(ex_tokens)
-                                # Find where score is non-zero (should be last token)
-                                nonzero_score_idx = [i for i, s in enumerate(ex_scores) if abs(s) > 0.01]
-                                seq_score = seq_scores[ex_idx].item()
-                                seq_adv = seq_advantages[ex_idx].item()
-
-                                print(f"[DEBUG] Example {ex_idx}: score={seq_score:.1f}, total_adv={seq_adv:.4f}", flush=True)
-                                print(f"[DEBUG] Example {ex_idx}: Response (last 100 chars): ...{decoded[-100:]}", flush=True)
-                                if nonzero_score_idx:
-                                    for idx in nonzero_score_idx[-3:]:  # Last 3 non-zero scores
-                                        tok = self.tokenizer.decode([ex_tokens[idx]])
-                                        print(f"[DEBUG]   Token[{idx}]='{tok}' score={ex_scores[idx]:.2f} adv={ex_advs[idx]:.4f}", flush=True)
-                            except Exception as e:
-                                print(f"[DEBUG] Example {ex_idx}: decode error: {e}", flush=True)
 
                     if self._debug_enabled:
                         debug_batch_data(batch, self.global_steps, "after_advantage", self._debug_output_dir)
@@ -551,9 +518,10 @@ class RayAtroposTrainer(RayPPOTrainer):
                     should_sync, staleness_metrics = self._should_sync_weights()
                     metrics.update(staleness_metrics)
 
+                    # Handle initial sync (force sync on first step after checkpoint)
+                    # Don't clear the flag here - only clear it after sync actually happens
                     if self._force_initial_sync:
                         should_sync = True
-                        self._force_initial_sync = False
                         logger.info("Forcing initial weight sync...")
 
                     batch.meta_info["do_sync"] = should_sync
@@ -563,13 +531,51 @@ class RayAtroposTrainer(RayPPOTrainer):
                         if self.global_steps in self._debug_save_tensors_at_steps:
                             save_batch_tensors(batch, self.global_steps, self._debug_output_dir)
 
+                    # Check response_mask before actor update - skip if too many samples empty
+                    rm = batch.batch["response_mask"]
+                    rm_per_sample = rm.sum(dim=-1)
+                    valid_samples = (rm_per_sample > 0).sum().item()
+                    total_samples = rm.shape[0]
+                    total_valid_tokens = rm.sum().item()
+
+                    # CRITICAL: Skip if NO valid response tokens at all - would crash in verl
+                    if valid_samples == 0 or total_valid_tokens == 0:
+                        logger.error(f"[SKIP] CRITICAL: Batch has 0 valid response tokens - skipping to avoid crash")
+                        # Still sync if needed to prevent staleness from compounding
+                        if should_sync:
+                            logger.info(f"[SYNC] Syncing weights despite skip (staleness prevention)")
+                            self.actor_rollout_wg.sync_weights_only()
+                            self._update_sync_state()
+                        self.global_steps += 1
+                        progress_bar.update(1)
+                        continue
+
+                    # Skip batch if less than half samples are valid (too much filtering causes chunk issues)
+                    # BUT don't skip if we need to do initial sync (checkpoint weights -> rollout server)
+                    if valid_samples < total_samples // 2 and not self._force_initial_sync:
+                        logger.warning(f"[SKIP] Only {valid_samples}/{total_samples} valid samples - skipping batch")
+                        # Still sync if needed to prevent staleness from compounding
+                        if should_sync:
+                            logger.info(f"[SYNC] Syncing weights despite skip (staleness prevention)")
+                            self.actor_rollout_wg.sync_weights_only()
+                            self._update_sync_state()
+                        self.global_steps += 1
+                        progress_bar.update(1)
+                        continue
+                    elif valid_samples < total_samples // 2 and self._force_initial_sync:
+                        logger.warning(f"[SYNC] {valid_samples}/{total_samples} valid but forcing initial sync to update rollout server weights")
+
                     with marked_timer("update_actor", timing_raw, color="magenta"):
                         actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        actor_output_metrics = safe_reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
                     if should_sync:
                         self._update_sync_state()
+                        # Clear initial sync flag only after sync actually happens
+                        if self._force_initial_sync:
+                            self._force_initial_sync = False
+                            logger.info("Initial weight sync completed")
 
                 data_metrics = compute_data_metrics(batch=batch, use_critic=False)
                 metrics.update(data_metrics)

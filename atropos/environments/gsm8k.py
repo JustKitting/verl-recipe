@@ -56,7 +56,7 @@ class GSM8kEnv(BaseEnv):
         # Track attempts per question index to skip broken questions
         self.question_attempts = {}
         self.skipped_questions = set()
-        self.max_attempts_per_question = 100
+        self.max_attempts_per_question = 200
 
     @classmethod
     def config_init(cls) -> Tuple[BaseEnvConfig, List[APIServerConfig]]:
@@ -380,9 +380,27 @@ class GSM8kEnv(BaseEnv):
                         # Apply linear penalty scaling from 1.0 down to 0.0
                         scores["scores"].append(1.0 - percentage_of_range)
             if all([scores["scores"][0] == score for score in scores["scores"]]):
-                print(f"[SCORE] REJECTED: All scores same ({scores['scores'][0]})")
-                return None  # If all the same, we return None
-            print(f"[SCORE] ACCEPTED: Variance in scores")
+                if scores["scores"][0] > 0:
+                    # All correct with same length-penalty score - rank by actual length
+                    # Shorter responses get higher scores to create variance
+                    token_lengths = [len(t) for t in scores["tokens"]]
+                    min_len, max_len = min(token_lengths), max(token_lengths)
+                    if max_len > min_len:
+                        # Normalize lengths to scores: shorter = higher (0.5 to 1.0 range)
+                        scores["scores"] = [
+                            1.0 - 0.5 * (length - min_len) / (max_len - min_len)
+                            for length in token_lengths
+                        ]
+                        print(f"[SCORE] ACCEPTED: All correct, ranked by length")
+                    else:
+                        # Truly identical lengths - add small noise for variance
+                        scores["scores"] = [0.5 + random.uniform(0, 0.1) for _ in scores["scores"]]
+                        print(f"[SCORE] ACCEPTED: All correct identical length, added noise")
+                else:
+                    print(f"[SCORE] REJECTED: All scores same ({scores['scores'][0]})")
+                    return None
+            else:
+                print(f"[SCORE] ACCEPTED: Variance in scores")
             return scores
         else:
             # If the gold solution is not parseable, we return None
@@ -406,6 +424,7 @@ class GSM8kEnv(BaseEnv):
             if self.question_attempts[idx] > self.max_attempts_per_question:
                 self.skipped_questions.add(idx)
                 print(f"[SKIP] Question {idx} exceeded {self.max_attempts_per_question} attempts, skipping permanently")
+                print(f"[BG_ERROR] Training probably degenerate - question {idx} hit {self.max_attempts_per_question} attempts. Total skipped: {len(self.skipped_questions)}")
                 continue
 
             return self.train[idx]

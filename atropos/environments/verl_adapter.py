@@ -16,9 +16,15 @@
 import argparse
 import importlib
 import sys
+import time
+import traceback
 from typing import Optional
 
-from ..utils import create_verl_adapter  # Applies patches on import
+from ..utils import create_verl_adapter, set_ray_connection
+
+MAX_RETRIES = 10
+INITIAL_BACKOFF = 5.0
+MAX_BACKOFF = 60.0
 
 
 def find_env_class(module):
@@ -57,8 +63,12 @@ def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--env-module", required=True)
     parser.add_argument("--env-class", default=None)
-    parser.add_argument("--tokenizer", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--tokenizer", default="Qwen/Qwen2.5-3B")
+    parser.add_argument("--ray-namespace", default="verl")
+    parser.add_argument("--ray-address", default="auto")
     args, remaining = parser.parse_known_args()
+
+    set_ray_connection(namespace=args.ray_namespace, address=args.ray_address)
 
     print(f"Loading: {args.env_module}")
     BaseEnvClass = load_env(args.env_module, args.env_class)
@@ -66,7 +76,30 @@ def main():
 
     WrappedEnv = create_verl_adapter(BaseEnvClass, default_tokenizer=args.tokenizer)
     sys.argv = [sys.argv[0]] + remaining
-    WrappedEnv.cli()
+
+    backoff = INITIAL_BACKOFF
+    for attempt in range(MAX_RETRIES):
+        try:
+            WrappedEnv.cli()
+            break
+        except SystemExit as e:
+            if e.code == 0:
+                break
+            print(f"[verl_adapter] Environment exited with code {e.code}")
+            raise
+        except Exception as e:
+            print(f"\n[verl_adapter] Environment crashed (attempt {attempt + 1}/{MAX_RETRIES})")
+            print(f"[verl_adapter] Error: {type(e).__name__}: {e}")
+            traceback.print_exc()
+
+            if attempt + 1 >= MAX_RETRIES:
+                print(f"[verl_adapter] Max retries exceeded, giving up")
+                raise
+
+            print(f"[verl_adapter] Restarting in {backoff:.1f}s...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF)
+            print(f"[verl_adapter] Restarting environment...")
 
 
 if __name__ == "__main__":

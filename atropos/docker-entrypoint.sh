@@ -25,7 +25,6 @@ detect_gpu_and_configure() {
 }
 
 apply_patches() {
-    # Apply FSDP workers patch (respects param_offload config for ref models)
     FSDP_WORKERS=$(python -c "import verl.workers.fsdp_workers as fw; print(fw.__file__)" 2>/dev/null || echo "")
     if [[ -n "$FSDP_WORKERS" && -f "$FSDP_WORKERS" ]]; then
         sed -i 's|cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)|cpu_offload = None if role == "actor" else (CPUOffload(offload_params=True) if getattr(fsdp_config, "param_offload", False) else None)|' "$FSDP_WORKERS" 2>/dev/null || true
@@ -33,13 +32,11 @@ apply_patches() {
         echo "Applied FSDP workers patch"
     fi
 
-    # Apply SGLang template_manager patch (handles dict/list chat_template for Hermes models)
     SGLANG_TM=$(python -c "import sglang.srt.managers.template_manager as tm; print(tm.__file__)" 2>/dev/null || echo "")
     if [[ -n "$SGLANG_TM" && -f "$SGLANG_TM" ]]; then
         sed -i 's/has_reasoning = re.search(force_reasoning_pattern, template) is not None/has_reasoning = re.search(force_reasoning_pattern, template) is not None if isinstance(template, str) else False/' "$SGLANG_TM" 2>/dev/null || true
         echo "Applied SGLang template_manager patch"
     fi
-
 }
 
 show_help() {
@@ -49,58 +46,42 @@ Atropos + VeRL Training
 Usage: docker run --gpus all atropos-verl [OPTIONS]
 
 Options:
-  --atropos-config PATH  Atropos config file (default: configs/atropos.yaml)
-  --verl-config PATH     VeRL config file (default: configs/verl.yaml)
-  --env-module MODULE    Override environment module
-  --model MODEL          Override model path
-  --steps N              Override training steps
+  --model MODEL          Model path (default: Qwen/Qwen2.5-3B)
+  --steps N              Training steps (default: 1000)
+  --batch-size N         Batch size (default: 128)
+  --group-size N         Rollouts per prompt (default: 8)
+  --lr RATE              Learning rate (default: 1e-5)
   --max-tokens N         Max token length (default: 2048)
-  --wandb                Enable W&B logging (requires WANDB_API_KEY env var)
+  --temperature T        Sampling temperature (default: 0.7)
+  --gpu-memory F         GPU memory utilization 0-1 (default: 0.15)
+  --gpus N               Number of GPUs
+  --wandb                Enable W&B logging
+  --wandb-project NAME   W&B project name
+  --atropos-config PATH  Atropos config file
+  --verl-config PATH     VeRL config file
   --shell                Interactive shell
 
 Example:
   docker run --gpus all -e WANDB_API_KEY=$WANDB_API_KEY atropos-verl \
-    --env-module environments.gsm8k_server --steps 1000
+    --model Qwen/Qwen2.5-3B --steps 1000 --wandb
 EOF
 }
 
 main() {
-    ATROPOS_CONFIG="/workspace/atropos/configs/atropos.yaml"
-    VERL_CONFIG="/workspace/atropos/configs/verl.yaml"
-
-    # Generate unique Ray namespace to isolate this run from others
-    RUN_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | cut -c1-8 || date +%s)
-    export VERL_RAY_NAMESPACE="verl-${RUN_ID}"
-    OVERRIDES="ray_kwargs.ray_init.namespace=${VERL_RAY_NAMESPACE}"
+    CLI_ARGS=()
 
     while [[ $# -gt 0 ]]; do
         case $1 in
             --help|-h) show_help; exit 0 ;;
-            --atropos-config) ATROPOS_CONFIG="$2"; shift 2 ;;
-            --verl-config) VERL_CONFIG="$2"; shift 2 ;;
-            --env-module) OVERRIDES="$OVERRIDES atropos.environment_module=$2"; shift 2 ;;
-            --model) OVERRIDES="$OVERRIDES model.path=$2 env.tokenizer_name=$2"; shift 2 ;;
-            --steps) OVERRIDES="$OVERRIDES training.total_steps=$2 env.total_steps=$2 trainer.total_training_steps=$2"; shift 2 ;;
-            --batch-size) OVERRIDES="$OVERRIDES training.batch_size=$2 env.batch_size=$2"; shift 2 ;;
-            --group-size) OVERRIDES="$OVERRIDES training.group_size=$2 env.group_size=$2"; shift 2 ;;
-            --max-tokens) OVERRIDES="$OVERRIDES env.max_token_length=$2"; shift 2 ;;
-            --wandb) OVERRIDES="$OVERRIDES env.use_wandb=true"; shift ;;
             --shell) detect_gpu_and_configure; apply_patches; exec /bin/bash ;;
-            *) OVERRIDES="$OVERRIDES $1"; shift ;;
+            *) CLI_ARGS+=("$1"); shift ;;
         esac
     done
 
     detect_gpu_and_configure
     apply_patches
 
-    echo "Atropos config: $ATROPOS_CONFIG"
-    echo "VeRL config: $VERL_CONFIG"
-    [[ -n "$OVERRIDES" ]] && echo "Overrides:$OVERRIDES"
-
-    exec python -m atropos.main \
-        --atropos-config "$ATROPOS_CONFIG" \
-        --verl-config "$VERL_CONFIG" \
-        $OVERRIDES
+    exec python -m atropos.main "${CLI_ARGS[@]}"
 }
 
 main "$@"

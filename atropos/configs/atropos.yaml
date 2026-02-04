@@ -8,7 +8,7 @@ env:
   tokenizer_name: "Qwen/Qwen2.5-3B"
   use_wandb: false
   rollout_server_url: "http://localhost:8000"
-  wandb_name: "verl-atropos"
+  wandb_name: "gsm8k-verl-atropos"
   ensure_scores_are_not_same: false
   max_token_length: 2048
   max_num_workers: 24
@@ -16,9 +16,9 @@ env:
   steps_per_eval: 100
 
 sync:
-  min_steps_between_sync: 4
-  max_steps_between_sync: 8
-  queue_threshold: 1
+  min_steps_between_sync: 2
+  max_steps_between_sync: 4
+  queue_threshold: 2
 
 openai:
   - model_name: "Qwen/Qwen2.5-3B"

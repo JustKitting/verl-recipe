@@ -60,7 +60,7 @@ class AtroposDataSource:
         batch_size: int,
         max_token_len: int,
         wandb_group: str = "atropos_verl",
-        wandb_project: str = "atropos_verl",
+        wandb_project: str = None,
         checkpoint_dir: str = "./checkpoints",
         save_checkpoint_interval: int = 100,
         starting_step: int = 0,
@@ -220,7 +220,7 @@ class AtroposDataSource:
                 prompt_lengths[i] = seq_len
 
         if (response_lengths == 0).any():
-            bad_indices = (response_lengths == 0).nonzero().squeeze(-1).tolist()
+            bad_indices = (response_lengths == 0).nonzero(as_tuple=True)[0].tolist()
             raise ValueError(f"Samples {bad_indices} have no response tokens")
 
         max_prompt_len = max(prompt_lengths.max().item(), 1)
@@ -303,6 +303,23 @@ class AtroposDataSource:
         tensor_dict = TensorDict(batch_dict, batch_size=[batch_size])
         uids = np.array(all_uids, dtype=object)
         batch_seqlens = response_only_mask.sum(dim=1).long().tolist()
+
+        # Final validation - ensure every sample has valid response tokens
+        per_sample_valid = response_only_mask.sum(dim=1)
+        if (per_sample_valid == 0).any():
+            bad_idx = (per_sample_valid == 0).nonzero(as_tuple=True)[0].tolist()
+            logger.error(f"Samples {bad_idx} have empty response_mask after processing")
+            # Filter out bad samples
+            good_mask = per_sample_valid > 0
+            if not good_mask.any():
+                logger.error("All samples have empty response_mask - returning None")
+                return None
+            good_idx = good_mask.nonzero(as_tuple=True)[0]
+            tensor_dict = tensor_dict[good_idx]
+            uids = uids[good_idx.numpy()]
+            batch_seqlens = [batch_seqlens[i] for i in good_idx.tolist()]
+            batch_size = len(good_idx)
+            logger.warning(f"Filtered to {batch_size} valid samples")
 
         return DataProto(
             batch=tensor_dict,

@@ -12,11 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-WORKDIR /workspace
-COPY requirements.txt /workspace/atropos/requirements.txt
-RUN pip install --no-cache-dir -r /workspace/atropos/requirements.txt
+WORKDIR /workspace/atropos
+COPY requirements.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . /workspace/atropos/
+COPY . .
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 

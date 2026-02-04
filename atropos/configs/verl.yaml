@@ -1,6 +1,8 @@
 data:
   truncation: error
   trust_remote_code: false
+  max_prompt_length: 1024
+  max_response_length: 2048
 
 algorithm:
   adv_estimator: grpo
@@ -9,15 +11,21 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   rollout_correction:
-    rollout_rs: "sequence"
-    rollout_rs_threshold: 2.0
-    rollout_is: "sequence"
-    rollout_is_threshold: 2.0
+    # Geometric RS for rejection, no explicit IS (PPO ratio handles it)
+    rollout_rs: "geometric"
+    rollout_rs_threshold: 3.0
+    rollout_rs_threshold_lower: 0.3
+    rollout_is: null  # Disabled - PPO ratio handles IS correction
+    rollout_is_threshold: 5.0
+    # Veto sequences with ANY token having IS weight < threshold
+    # This catches catastrophic per-token staleness that geometric mean misses
+    rollout_token_veto_threshold: 0.0000000001  # 1e-10, log threshold = -23
 
 trainer:
   nnodes: 1
   n_gpus_per_node: null
   val_before_train: false
+  resume_mode: disable
 
 model:
   lora_rank: 0
@@ -36,8 +44,7 @@ actor:
   grad_clip: 1.0
   clip_ratio: 0.2
   use_kl_loss: true
-  kl_loss_coef: 0.001
-  kl_loss_type: "low_var_kl"
+  kl_loss_coef: 0.0
   fsdp_config:
     param_offload: false
     optimizer_offload: false
@@ -47,7 +54,7 @@ rollout:
   engine: sglang
   mode: async
   prompt_length: 1024
-  response_length: 1024
+  response_length: 2048
   temperature: 0.7
   tensor_model_parallel_size: 1
   gpu_memory_utilization: 0.15
@@ -69,7 +76,7 @@ ref:
 
 checkpoint:
   dir: "./checkpoints/"
-  save_interval: 500
+  save_interval: 50
 
 ray_kwargs:
   ray_init:
